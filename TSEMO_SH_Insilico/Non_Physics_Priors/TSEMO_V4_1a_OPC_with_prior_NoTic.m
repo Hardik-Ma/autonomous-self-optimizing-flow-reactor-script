@@ -1,0 +1,1214 @@
+function [Xpareto,Ypareto,X,Y,XParetoGP,YParetoGP,YParetoGPstd,hypf] = TSEMO_V4_1a_OPC_with_prior(f,X,Y,lb,ub,opt,c1_0,c2_0,V_R,t_meas,prior_functions) %,c1_0,c2_0
+%  Copyright (c) by Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin, 2020-23-05.
+%  Version 4 by Eric Bradford (eric.bradford@ntnu.no), Artur M.
+%  Schweidtmann (Artur.Schweidtmann@avt.rwth-aachen.de) and Alexei Lapkin
+%  (aal35@cam.ac.uk)
+%
+%  MODIFIED VERSION with chemical prior mean functions for GP
+
+% ALGORITHM  Executes the optimization algorithm.
+
+%   OUTPUTS
+%       Xpareto      Pareto front approximation from X inputs       [np,D]
+%       Ypareto      Pareto front approximation from Y outputs      [np,O]
+%       X            Data input vector                              [n+meval,D]
+%       Y            Data output vector                             [n+meval,O]
+%       XParetoGP    Pareto front approximation of GP model inputs  [npGP,D]
+%       YParetoGP    Pareto front approximation of GP model outputs [npGP,D]
+%       YParetoGPstd Pareto front standard deviation of GP model    [npGP,D]
+%       hypf         Final hyperparameter values []                 [D+2,O]
+
+%   INPUTS
+%       f       objective function
+%       X       input values of given data set  [n,D]
+%       Y       output values of given data set [n,O]
+%       lb      lower bounds of input variables [1,D]
+%       ub      upper bounds of input variables [1,D]
+%       Opt     options struct of algorithm
+
+%   with
+%       n       number of given data points
+%       meval   maximum number of function evaluations
+%       np      number of pareto points of the final dataset
+%       npGP    number of pareto points of GP model dataset
+%       D       dimension of input space
+%       O       dimension of output space
+
+% Molecular Mass [g/mol]
+M_1 = 159.09;
+M_2 = 87.12;
+M_F = 18.99;
+M_H = 1.00;
+M_3 = M_1 + M_2 - M_F - M_H;
+M_4 = M_3;
+M_5 = M_3 + M_2 - M_F - M_H;
+
+%% Initialize option structure
+it = 1;
+
+% First, ensure opt has necessary fields
+if ~isfield(opt, 'Gen')
+    opt.Gen.NoOfGPs = size(Y,2);
+    opt.Gen.NoOfInputDim = size(X,2);
+end
+
+% Now call set_option_structure
+Opt = set_option_structure(opt,X,Y);
+
+%% Add prior functions to Opt structure if provided
+if nargin > 10 && exist('prior_functions', 'var') && ~isempty(prior_functions)
+    fprintf('Using chemical prior mean functions for GP models\n');
+    for j = 1:Opt.Gen.NoOfGPs
+        if j <= length(prior_functions)
+            Opt.GP(j).prior_mean = prior_functions{j};
+            fprintf('  GP %d: Prior mean function added\n', j);
+        else
+            Opt.GP(j).prior_mean = [];
+        end
+    end
+else
+    % Check if prior_functions was provided but empty
+    if nargin > 10
+        fprintf('No prior mean functions provided. Using zero prior.\n');
+    end
+    for j = 1:Opt.Gen.NoOfGPs
+        Opt.GP(j).prior_mean = [];
+    end
+end
+
+%% Write initial text file for TSEMO_log
+create_log_file(X,Y,Opt,f,lb,ub) %%f???
+
+for i = 1:ceil(Opt.maxeval/Opt.NoOfBachSequential)
+    iteration_start_time = datetime('now');  % Track iteration time
+    %tic;
+    %% Scale Variables
+    [Xnew,Ynew] = ScaleVariables(X,Y,lb,ub,Opt) ;
+    
+    %% Training of GP
+    for j = 1:Opt.Gen.NoOfGPs
+        if isfield(Opt.GP(j), 'prior_mean') && ~isempty(Opt.GP(j).prior_mean)
+            % Scale inputs to [0,1] for prior function
+            X_scaled = zeros(size(X));
+            for d = 1:size(X,2)
+                X_scaled(:,d) = (X(:,d) - lb(d)) / (ub(d) - lb(d));
+            end
+            % Get prior mean predictions at training points
+            Y_prior = Opt.GP(j).prior_mean(X_scaled);
+            % Scale prior to match standardised GP target (zero-mean/unit-var)
+            Y_prior_scaled = (Y_prior - mean(Y(:,j))) / std(Y(:,j));
+            % FIX: store Y_prior_scaled so sampling functions can use it
+            Opt.GP(j).Y_prior_scaled = Y_prior_scaled;
+            % Train GP on residuals (Y - prior)
+            Opt.GP(j).hyp = TrainingOfGP_with_prior(Xnew, Ynew(:,j), Opt.GP(j), Y_prior_scaled);
+        else
+            % Train GP without prior (original)
+            Opt.GP(j).hyp = TrainingOfGP(Xnew,Ynew(:,j),Opt.GP(j));
+            Opt.GP(j).Y_prior_scaled = [];
+        end
+    end
+    
+    %% Draw samples of GPs
+    % FIX: pass Y_prior_scaled so spectral sampler uses residuals not raw Ynew
+    for j = 1:Opt.Gen.NoOfGPs
+        if isfield(Opt.GP(j), 'prior_mean') && ~isempty(Opt.GP(j).prior_mean)
+            Opt.Sample(j).f = posterior_sample_with_prior(Xnew, Ynew(:,j), Opt.GP(j), Opt.GP(j).Y_prior_scaled);
+        else
+            Opt.Sample(j).f = posterior_sample(Xnew,Ynew(:,j),Opt.GP(j));
+        end
+    end
+    
+    %% Determine pareto front of function samples
+    [Sample_pareto,Sample_xpareto,Sample_nadir] = Find_sample_pareto(Opt,i);
+    Opt.warmstart_pareto = Sample_xpareto; 
+    
+    %% Sampling point at maximum hypervolume improvement
+    [index,hv_imp] = hypervolume_improvement_index(Ynew,Sample_nadir,Sample_pareto,Opt);
+    
+    xNew = Sample_xpareto(index,:);
+    Xnew = [Xnew;xNew];
+    
+    for j = 1:Opt.Gen.NoOfInputDim
+        xnewtrue(:,j) = xNew(:,j)*(ub(j)-lb(j)) + lb(j);
+    end
+    
+    %% New optimal experiment (Updated for OPC-Connection, Line 71:145)
+    tau = xnewtrue(:,1); %min
+    tau_sec_neu = xnewtrue(:,1).*60; % sec (modification)
+    T = xnewtrue(:,2); %°C
+    T = round(T,2); %round to 2nd digit
+
+    % Transfer tau to flow
+    Q_tot = V_R./tau; %mL/min
+    Q_i = Q_tot./2; 
+
+    disp('---------------------------------------------')
+    disp(['Opt.Exp.No: ' num2str(it)])
+
+    %% 3.1a) Setpoint Temperature
+    %{
+    writeValue(uaClient ,T_OUT, T);
+    %tic
+    temperature_data = [];  % Initialize array to store [time, temperature]
+    start_time = datetime('now');  % Use datetime instead of tic
+    % while waiting for T-Setpoint, set pumps to minimum flow
+    writeValue(uaClient ,Q_OUT, 0.02);
+    writeValue(uaClient ,Q2_OUT, 0.02);
+    disp('1b) Setpoint of Thermostat')
+    disp(['     T = ' num2str(T) ' °C']) 
+    % Waiting Loop for Thermostat
+    while abs(readValue(T_IN)-T)>0.1
+        current_time = seconds(datetime('now') - start_time);
+        current_temp = readValue(T_IN);
+        temperature_data = [temperature_data; current_time, current_temp];
+    end
+    % Record final point
+    current_time = seconds(datetime('now') - start_time);
+    current_temp = readValue(T_IN);
+    temperature_data = [temperature_data; current_time, current_temp];
+    time_op_thermostat(it) = seconds(datetime('now') - start_time)./60;  % Save time of Thermostat
+    disp(['Thermostat time: ' num2str(time_op_thermostat(it)) ' min']);
+    %% Save temperature profile data to CSV
+    filename = sprintf('Temperature_Profile_OPExp%d_T%.1fC.csv', it, T);
+    % Create table with time and temperature data
+    data_table = table();
+    data_table.Time_sec = temperature_data(:,1);
+    data_table.Temperature_C = temperature_data(:,2);
+    data_table.SetTemperature_C = repmat(T, size(temperature_data,1), 1);
+    data_table.ExperimentNumber = repmat(it, size(temperature_data,1), 1);
+    % Save to CSV
+    writetable(data_table, filename);
+    
+    disp(['Temperature profile saved to: ' filename]);
+        
+%%  3.1b) Setpoint Pumps
+    writeValue(uaClient ,Q_OUT, Q_i);
+    writeValue(uaClient ,Q2_OUT, Q_i);
+    pump_start_time = datetime('now');
+    disp('1a) Setpoint of Pumps')
+    disp(['     Q1 = ' num2str(round(Q_i,2)) ' ml/min'])
+    disp(['     Q2 = ' num2str(round(Q_i,2)) ' ml/min'])
+    % Waiting Loop for Pumps
+    % Important for PID-controlled Pumps (Syringe pumps: Q_IST = Q_SOLL in seconds)
+    % while readValue(Q_IN) ~= Q_i || readValue(Q2_IN) ~= Q_i
+    while abs(Q_i-round(readValue(Q_IN),2))>0.02 || abs(Q_i-round(readValue(Q2_IN),2))>0.02
+    end
+    time_op_pumps(it) = seconds(datetime('now') - pump_start_time)./60;  % Save time of pumps
+    disp(['Pumps time: ' num2str(time_op_pumps(it)) ' min']);
+
+    %% 3.2) SteadyState-Time
+    % Waiting Loop for SS
+    time_SS = 0.1.*tau; %min    %!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    steady_state_start = datetime('now');
+    disp('3) SteadyStateTime')
+    disp(['     tau = ' num2str(tau) ' min'])
+    pause(time_SS*60) %sec.
+    timestamp_SS = datetime('now');
+    time_op_steadyState(it) = seconds(datetime('now') - steady_state_start)./60;  % Time for Steady-State
+    disp(['Steady-state time: ' num2str(time_op_steadyState(it)) ' min']);
+%}
+    %% 3.3) Online MIR measurment (include PLS Regression, etc.)
+    %{
+    %tic
+    NoMeas = 3;
+    disp(['d) Take ' num2str(NoMeas) ' Measurements'])
+    % Waiting Loop for Measurement in SteadyState
+    while t.UserData.timestamp - seconds(t_meas) < timestamp_SS  % ???Attention???
+    end
+    N_1st = t.UserData.N_Meas;
+    % Waiting Loop for x Measurements
+    NoMeas = 3;
+    for j=1:NoMeas
+        while t.UserData.N_Meas < N_1st+j 
+            if t.UserData.N_Meas == N_1st + NoMeas-1
+                break
+            end
+        end
+    end
+    
+%}
+    % calculation of response data from mean of last 3 measurments 
+% calculation of response data from mean of last 3 measurments 
+    for l = 1 : size(xnewtrue,1)
+        %c_out_op = mean(t.UserData.C(end-2:end,:)); % Test !!!
+
+        %%%%% Dummy Experiment %%%%%
+        c_out_op = f_PFR_2nd_order(xnewtrue(l,:),c1_0,c2_0);  % FIXED: use (l,:) and don't store as matrix
+        %%%%%
+
+        % update objective functions !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        ytrue(l,1) = -log(M_3.*c_out_op(3)./(tau_sec_neu));                 %STY (g.L-3.s-1) (with correct index)
+        %ytrue(l,1) = -log((c1_0-c_out_op(1))/c1_0);      %Conversion
+        %ytrue(l,2) = -log(c_out_op(2)./(c_out_op(2)+c_out_op(3)+c_out_op(4)));      %neu selectivity
+        ytrue(l,2) = -log(c_out_op(3)./(c_out_op(3)+c_out_op(4)+c_out_op(5))); %neu selectivity - FIXED: removed (1,3)
+        %ytrue(l,2) = log((M_4.*c_out_op(4)+ M_5.*c_out_op(5))./(M_1.*c_out_op(1) + M_3.*c_out_op(3) + M_4.*c_out_op(4)+ M_5.*c_out_op(5))); % impurities 
+        %ytrue(l,2) = -log(c_out_op(2)./(c1_0-c_out_op(1)));      %selectivity (-)
+    end
+    X = [X;xnewtrue];
+    Y = [Y;ytrue];
+    Ynew = zeros(size(Y,1),Opt.Gen.NoOfGPs);
+    for j = 1:Opt.Gen.NoOfGPs
+        Ynew(:,j) = (Y(:,j) - mean(Y(:,j)))/std(Y(:,j));
+    end
+
+    %time_op_Measurement(it) = toc./60;  % Time for MIR measurement
+    %disp(['Measurment time: ' num2str(time_op_Measurement(it)) ' min']);
+Y(end,1)
+    disp(['Opt.Meas.No:' num2str(l) ])
+    disp(['     Y = ' num2str(exp(-Y(end,1)))])
+    disp(['     SEL = ' num2str(exp(-Y(end,2)))])
+    disp(['    c_out = ' num2str(c_out_op)])
+    disp('---------------------------------------------')
+    disp('---------------------------------------------')
+    
+    %% Visulization
+    %{
+    figure(2)
+    colororder("sail")
+    subplot(2,1,2)
+    bar(it,[time_op_thermostat(it) time_op_pumps(it) time_op_steadyState(it) time_op_Measurement(it) 0],'stacked');
+    hold on
+    xlabel('Exp.No')
+    ylabel('time [min]')
+    legend('Thermostat', 'Pumpen', 'Steady-State','Measurement','AutoUpdate','off');
+    title('Optimal Exp.')
+%}
+    front = paretofront(Y);
+    Xpareto = X(front,:);
+    Ypareto = Y(front,:);
+    
+    %% Update log each iterations
+    iteration_elapsed = seconds(datetime('now') - iteration_start_time);
+    update_log_file(it,hv_imp,iteration_elapsed,xnewtrue,ytrue,Opt,Y,ub,lb)
+    
+    %% Display
+    if it == 1
+        fprintf('%10s %10s %10s %10s\n','Iteration', 'HypImp', 'Time(s)', 'PriorUsed');
+    end
+    if isfield(Opt.GP(1), 'prior_mean') && ~isempty(Opt.GP(1).prior_mean)
+        prior_flag = 'Yes';
+    else
+        prior_flag = 'No';
+    end
+    fprintf('%10d %10.4g %10.3g %10s\n', it, hv_imp, iteration_elapsed, prior_flag);
+    
+    it = it+1;
+    
+    %% Determine final hyperparameter values for analysis
+    if i == ceil(Opt.maxeval/Opt.NoOfBachSequential)
+        for j = 1:Opt.Gen.NoOfGPs
+            if isfield(Opt.GP(j), 'prior_mean') && ~isempty(Opt.GP(j).prior_mean)
+                % Scale inputs for prior function
+                X_scaled = zeros(size(X));
+                for d = 1:size(X,2)
+                    X_scaled(:,d) = (X(:,d) - lb(d)) / (ub(d) - lb(d));
+                end
+                % Get prior mean predictions
+                Y_prior = Opt.GP(j).prior_mean(X_scaled);
+                Y_prior_scaled = (Y_prior - mean(Y(:,j))) / std(Y(:,j));
+                Opt.GP(j).hyp = TrainingOfGP_with_prior(Xnew,Ynew(:,j),Opt.GP(j),Y_prior_scaled);
+            else
+                Opt.GP(j).hyp = TrainingOfGP(Xnew,Ynew(:,j),Opt.GP(j));
+            end
+        end
+        
+        hypf = zeros(Opt.Gen.NoOfInputDim+2,Opt.Gen.NoOfGPs);
+        for j = 1:Opt.Gen.NoOfGPs
+            covhyp = exp(Opt.GP(j).hyp.cov);
+            hypf(:,j) = [covhyp(1:Opt.Gen.NoOfInputDim).*(ub-lb)';covhyp(end)*std(Y(:,j));exp(Opt.GP(j).hyp.lik)*std(Y(:,j))];
+        end
+        
+        %% Obtain Pareto front from spectral Gaussian process model
+        for j = 1:Opt.Gen.NoOfGPs
+            if isfield(Opt.GP(j), 'prior_mean') && ~isempty(Opt.GP(j).prior_mean)
+                % FIX: pass Y_prior_scaled so mean_sample uses residuals
+                [Opt.Mean(j).f,Opt.Mean(j).varf] = mean_sample_with_prior(Xnew,Ynew(:,j),Opt.GP(j),Opt.GP(j).Y_prior_scaled);
+            else
+                [Opt.Mean(j).f,Opt.Mean(j).varf] = mean_sample(Xnew,Ynew(:,j),Opt.GP(j));
+            end
+        end
+        
+        [Mean_pareto,Mean_xpareto] = Find_mean_pareto(Opt);
+        
+        XParetoGP = zeros(size(Mean_xpareto,1), Opt.Gen.NoOfInputDim);
+        for j = 1:Opt.Gen.NoOfInputDim
+            XParetoGP(:,j) = Mean_xpareto(:,j)*(ub(j)-lb(j)) + lb(j);
+        end
+        
+        YParetoGP = zeros(size(Mean_pareto,1), Opt.Gen.NoOfGPs);
+        for j = 1:Opt.Gen.NoOfGPs
+            YParetoGP(:,j) = Mean_pareto(:,j)*std(Y(:,j)) + mean(Y(:,j));
+        end
+        
+        YParetoGPstd = zeros(size(Mean_pareto,1), Opt.Gen.NoOfGPs);
+        for j = 1:Opt.Gen.NoOfGPs
+            for k = 1:size(Mean_xpareto,1)
+                YParetoGPstd(k,j) = sqrt(Opt.Mean(j).varf(Mean_xpareto(k,:)))*std(Y(:,j));
+            end
+        end
+        
+        %% Update log with final results
+        final_log_update(Xpareto,Ypareto,X,Y,XParetoGP,YParetoGP,hypf,Opt)
+    end
+end
+return
+
+% =========================================================================
+% NEW FUNCTIONS FOR PRIOR MEAN SUPPORT
+% =========================================================================
+
+function [OptGPhyp] = TrainingOfGP_with_prior(Xnew, Ynew, OptGP, Y_prior)
+% Training of GP with prior mean function
+% Inputs:
+%   Xnew: Scaled input data [0,1]
+%   Ynew: Scaled output data (zero mean, unit variance)
+%   OptGP: GP options structure
+%   Y_prior: Prior mean predictions (scaled to match Ynew)
+
+% Subtract prior from observations to get residuals
+Y_residual = Ynew - Y_prior;
+
+% Now train GP on residuals using the original TrainingOfGP function
+OptGPhyp = TrainingOfGP(Xnew, Y_residual, OptGP);
+return
+
+function f = posterior_sample_with_prior(Xnew, Ynew, Opt, Y_prior_scaled)
+% Posterior sample with prior mean function
+% FIX: GP hyperparameters were trained on residuals (Ynew - Y_prior_scaled).
+%      The spectral sampler must also use residuals for consistency.
+%      The prior is added back inside the returned function handle.
+
+if isfield(Opt, 'prior_mean') && ~isempty(Opt.prior_mean) && nargin == 4
+    % Compute residuals — same as what TrainingOfGP_with_prior used
+    Y_residual = Ynew - Y_prior_scaled;
+    
+    % Draw spectral sample from GP trained on residuals (not raw Ynew)
+    f_base = posterior_sample(Xnew, Y_residual, Opt);
+    
+    % Add prior mean back at evaluation time
+    f = @(x) add_prior_to_prediction(x, f_base, Opt.prior_mean, mean(Ynew), std(Ynew));
+else
+    % No prior, use original
+    f = posterior_sample(Xnew, Ynew, Opt);
+end
+return
+
+function y_pred = add_prior_to_prediction(x, f_base, prior_fun, y_mean, y_std)
+% Helper to add prior mean to prediction
+% x: input in [0,1] scale
+% f_base: base GP prediction function (on residuals)
+% prior_fun: prior mean function expecting [0,1] inputs
+% y_mean, y_std: scaling parameters
+
+% Get prior prediction (already in scaled units if prior_fun is defined correctly)
+prior_scaled = prior_fun(x);
+
+% Get GP prediction on residuals
+residual_pred = f_base(x);
+
+% Add them together
+y_pred = prior_scaled + residual_pred;
+return
+
+function [f, varf] = mean_sample_with_prior(Xnew, Ynew, Opt, Y_prior_scaled)
+% Mean approximation with prior mean function
+% FIX: same residual consistency fix as posterior_sample_with_prior.
+
+if isfield(Opt, 'prior_mean') && ~isempty(Opt.prior_mean) && nargin == 4
+    % Compute residuals — same as what TrainingOfGP_with_prior used
+    Y_residual = Ynew - Y_prior_scaled;
+    
+    % Get mean and variance of GP trained on residuals (not raw Ynew)
+    [f_base, varf_base] = mean_sample(Xnew, Y_residual, Opt);
+    
+    % Add prior mean back at evaluation time
+    f = @(x) add_prior_to_prediction(x, f_base, Opt.prior_mean, mean(Ynew), std(Ynew));
+    varf = varf_base;  % Variance unchanged by adding deterministic prior
+else
+    % No prior, use original
+    [f, varf] = mean_sample(Xnew, Ynew, Opt);
+end
+return
+
+% =========================================================================
+% ORIGINAL FUNCTIONS (keep these exactly as in your original file)
+% =========================================================================
+
+function create_log_file(X,Y,Opt,f,lb,ub)
+try
+    function_name = func2str(f);
+    string1 = '';
+    string2 = {};
+    string3 = '';
+    string4 = '';
+    string5 = {};
+    string6 = '';
+    string7 = '';
+    for i = 1:size(X,2)
+        string1 = strcat(string1,'%8.4f ');
+        string2 = {string2{:},strcat('x',num2str(i))};
+        string3 = strcat(string3,'%+8s ');
+    end
+    for i = 1:size(Y,2)
+        string4 = strcat(string4,'%8.4f ');
+        string5 = {string5{:},strcat('f',num2str(i))};
+        string6 = strcat(string6,'%+8s ');
+        string7 = strcat(string7,'%8d ');
+    end
+    
+    TSEMO_log = fopen( 'TSEMO_log.txt', 'w');
+    fprintf(TSEMO_log,'\n %s %s \n', 'TSEMO log file created on',date);
+    fprintf(TSEMO_log,'\n %s','This file shows the initial specifications of TSEMO and logs the output.');
+    fprintf(TSEMO_log,'\n %s', '¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯');
+    
+    % Add prior function info
+    fprintf(TSEMO_log,'\n %s \n', 'Chemical Prior Information:');
+    if isfield(Opt.GP(1), 'prior_mean') && ~isempty(Opt.GP(1).prior_mean)
+        fprintf(TSEMO_log,'\n %s', 'Prior mean functions are ENABLED for all GPs');
+    else
+        fprintf(TSEMO_log,'\n %s', 'No prior mean functions (using zero prior)');
+    end
+    fprintf(TSEMO_log,'\n %s', '¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯');
+    
+    fprintf(TSEMO_log,'\n %s \n', 'License information');
+    fprintf(TSEMO_log,'\n %s \n', 'BSD 2-Clause License');
+    fprintf(TSEMO_log,'\n %s', 'Copyright (c) 2017, Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin');
+    fprintf(TSEMO_log,'\n %s \n', 'All rights reserved.');
+    fprintf(TSEMO_log,'\n %s', 'Redistribution and use in source and binary forms, with or without');
+    fprintf(TSEMO_log,'\n %s \n', 'modification, are permitted provided that the following conditions are met:');
+    fprintf(TSEMO_log,'\n %s   ', '*Redistributions of source code must retain the above copyright notice, this');
+    fprintf(TSEMO_log,'\n %s \n', ' list of conditions and the following disclaimer.');
+    fprintf(TSEMO_log,'\n %s   ', '*Redistributions in binary form must reproduce the above copyright notice,');
+    fprintf(TSEMO_log,'\n %s   ', ' this list of conditions and the following disclaimer in the documentation');
+    fprintf(TSEMO_log,'\n %s \n', ' and/or other materials provided with the distribution.');
+    fprintf(TSEMO_log,'\n %s', '¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯');
+    
+    fprintf(TSEMO_log,'\n %s \n', 'Problem specifications');
+    fprintf(TSEMO_log,'\n %s %s \n', 'Function used:  ',function_name);
+    fprintf(TSEMO_log,'\n %s %d', 'Number of inputs:  ',size(X,2));
+    fprintf(TSEMO_log,'\n %s %d \n', 'Number of outputs: ',size(Y,2));
+    fprintf(TSEMO_log,'\n %s', 'Lower bounds of decision variables:');
+    fprintf(TSEMO_log,strcat('\n',string3,'\n'),string2{:});
+    fprintf(TSEMO_log,string1,lb);
+    fprintf(TSEMO_log,'\n \n %s', 'Upper bounds of decision variables:');
+    fprintf(TSEMO_log,strcat('\n',string3,'\n'),string2{:});
+    fprintf(TSEMO_log,string1,ub);
+    fprintf(TSEMO_log,'\n %s', '¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯');
+    
+    fprintf(TSEMO_log,'\n %s \n', 'Algorithm options');
+    fprintf(TSEMO_log,'\n %s %d', 'Maximum number of function evaluations: ',Opt.maxeval);
+    fprintf(TSEMO_log,'\n %s %d', 'Sample batch size:                      ',Opt.NoOfBachSequential);
+    fprintf(TSEMO_log,'\n %s %d \n', 'Number of algorithm iterations:         ',ceil(Opt.maxeval/Opt.NoOfBachSequential));
+    fprintf(TSEMO_log,'\n %s %d', 'Genetic algorithm population size:       ',Opt.pop);
+    fprintf(TSEMO_log,'\n %s %d \n', 'Genetic algorithm number of generations: ',Opt.Generation);
+    fprintf(TSEMO_log,strcat('\n','%s',string6,'\n'),'                                         ',string5{:});
+    fprintf(TSEMO_log,strcat('%s',string7,'\n'), ' Number of spectral sampling points:     ',Opt.GP(1:size(Y,2)).nSpectralpoints);
+    fprintf(TSEMO_log,strcat('%s',string7), ' Type of matern function:                ',Opt.GP(1:size(Y,2)).matern);
+    fprintf(TSEMO_log,strcat('\n','%s',string7), ' Direct evaluations per input dimension: ',Opt.GP(1:size(Y,2)).fun_eval);
+    fprintf(TSEMO_log,'\n %s', '¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯');
+    
+    fprintf(TSEMO_log,'\n %s \n', 'Initial data set');
+    fprintf(TSEMO_log,'\n %s %d \n', 'Number of initial data points: ',size(X,1));
+    fprintf(TSEMO_log,'\n %s', 'Initial input data matrix:');
+    fprintf(TSEMO_log,strcat('\n',string3,'\n'),string2{:});
+    fprintf(TSEMO_log,strcat(string1,'\n'),X');
+    fprintf(TSEMO_log,'\n %s', 'Initial output data matrix:');
+    fprintf(TSEMO_log,strcat('\n',string6,'\n'),string5{:});
+    fprintf(TSEMO_log,strcat(string4,'\n'),Y');
+    fprintf(TSEMO_log,'\n %s', '¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯');
+    fclose(TSEMO_log) ;
+catch
+    warning('There was an error when writing the log file. Maybe the file was currently open in another program. The algorithm continues to run but some parts of the log file are maybe not correct.') ;
+    fclose('all') ;
+end
+return
+
+function update_log_file(it,hv_imp,toc,xnewtrue,ytrue,Opt,Y,ub,lb)
+try
+    string1 = '';
+    string2 = {};
+    string3 = '';
+    string4 = '';
+    string5 = {};
+    string6 = '';
+    string7 = '';
+    string8 = {};
+    for i = 1:Opt.Gen.NoOfInputDim
+        string1 = strcat(string1,'%8.4f ');
+        string2 = {string2{:},strcat('x',num2str(i))};
+        string3 = strcat(string3,'%+8s ');
+        string8 = {string8{:},strcat('lambda',num2str(i))};
+    end
+    string8 = {string8{:},'sigmaf'};
+    string8 = {string8{:},'sigman'};
+    for i = 1:Opt.Gen.NoOfGPs
+        string4     = strcat(string4,'%8.4f ');
+        string5     = {string5{:},strcat('f',num2str(i))};
+        string6     = strcat(string6,'%+8s ');
+        string7     = strcat(string7,'%8d ');
+        hypcov      = exp(Opt.GP(i).hyp.cov);
+        hypmat(:,i) = [hypcov(1:end-1).*(1./(ub-lb))';hypcov(end)*std(Y(:,i));exp(Opt.GP(i).hyp.lik)*std(Y(:,i))];
+    end
+    
+    TSEMO_log = fopen( 'TSEMO_log.txt', 'a');
+    fprintf(TSEMO_log,'\n %s %d \n', 'Algorithm iteration',it);
+    fprintf(TSEMO_log,'\n %s %8.4f', 'Predicted hypervolume improvement: ',hv_imp);
+    fprintf(TSEMO_log,'\n %s %8.4f \n', 'Time taken: ',toc);
+    fprintf(TSEMO_log,'\n %s', 'Proposed evaluation point(s): ');
+    fprintf(TSEMO_log,strcat('\n',string3,'\n'),string2{:});
+    fprintf(TSEMO_log,strcat(string1,'\n'),xnewtrue');
+    fprintf(TSEMO_log,'\n %s', 'Corresponding observation(s): ');
+    fprintf(TSEMO_log,strcat('\n',string6,'\n'),string5{:});
+    fprintf(TSEMO_log,strcat(string4,'\n'),ytrue);
+    fprintf(TSEMO_log,'\n %s', 'Current hyperparameter values: ');
+    fprintf(TSEMO_log,strcat('\n','%+16s',string6,'\n'),'Hyperparameter',string5{:});
+    for i = 1:Opt.Gen.NoOfInputDim+2
+        fprintf(TSEMO_log,strcat('%+16s',string4,'\n'),string8{i},hypmat(i,:));
+    end
+    fprintf(TSEMO_log,'\n %s', '¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯');
+    fclose(TSEMO_log) ;
+catch
+    warning('There was an error when writing the log file. Maybe the file was currently open in another program. The algorithm continues to run but some parts of the log file are maybe not correct.') ;
+    fclose('all') ;
+end
+return
+
+function final_log_update(Xpareto,Ypareto,X,Y,XParetoGP,YParetoGP,hypf,Opt)
+try
+    string1 = '';
+    string2 = {};
+    string3 = '';
+    string4 = '';
+    string5 = {};
+    string6 = '';
+    string7 = '';
+    string8 = {};
+    for i = 1:Opt.Gen.NoOfInputDim
+        string1 = strcat(string1,'%8.4f ');
+        string2 = {string2{:},strcat('x',num2str(i))};
+        string3 = strcat(string3,'%+8s ');
+        string8 = {string8{:},strcat('lambda',num2str(i))};
+    end
+    string8 = {string8{:},'sigmaf'};
+    string8 = {string8{:},'sigman'};
+    for i = 1:Opt.Gen.NoOfGPs
+        string4     = strcat(string4,'%8.4f ');
+        string5     = {string5{:},strcat('f',num2str(i))};
+        string6     = strcat(string6,'%+8s ');
+        string7     = strcat(string7,'%8d ');
+    end
+    
+    TSEMO_log = fopen( 'TSEMO_log.txt', 'a');
+    fprintf(TSEMO_log,'\n %s \n', 'Final algorithm output');
+    fprintf(TSEMO_log,'\n %s', 'Final input data matrix:');
+    fprintf(TSEMO_log,strcat('\n',string3,'\n'),string2{:});
+    fprintf(TSEMO_log,strcat(string1,'\n'),X');
+    fprintf(TSEMO_log,'\n %s', 'Final output data matrix:');
+    fprintf(TSEMO_log,strcat('\n',string6,'\n'),string5{:});
+    fprintf(TSEMO_log,strcat(string4,'\n'),Y');
+    fprintf(TSEMO_log,'\n %s', 'Input data matrix of corresponding Pareto front:');
+    fprintf(TSEMO_log,strcat('\n',string3,'\n'),string2{:});
+    fprintf(TSEMO_log,strcat(string1,'\n'),Xpareto');
+    fprintf(TSEMO_log,'\n %s', 'Output data matrix of corresponding Pareto front:');
+    fprintf(TSEMO_log,strcat('\n',string6,'\n'),string5{:});
+    fprintf(TSEMO_log,strcat(string4,'\n'),Ypareto');
+    fprintf(TSEMO_log,'\n %s', 'Input data matrix of Pareto front of final Gaussian process model:');
+    fprintf(TSEMO_log,strcat('\n',string3,'\n'),string2{:});
+    fprintf(TSEMO_log,strcat(string1,'\n'),XParetoGP');
+    fprintf(TSEMO_log,'\n %s', 'Output data matrix of Pareto front of final Gaussian process model:');
+    fprintf(TSEMO_log,strcat('\n',string6,'\n'),string5{:});
+    fprintf(TSEMO_log,strcat(string4,'\n'),YParetoGP');
+    fprintf(TSEMO_log,'\n %s', 'Final hyperparameter values: ');
+    fprintf(TSEMO_log,strcat('\n','%+16s',string6,'\n'),'Hyperparameter',string5{:});
+    for i = 1:Opt.Gen.NoOfInputDim+2
+        fprintf(TSEMO_log,strcat('%+16s',string4,'\n'),string8{i},hypf(i,:));
+    end
+    fclose(TSEMO_log) ;
+    
+    %% ========================================================================
+    %% NEW FEATURE: Save GP Pareto front data to separate CSV files
+    %% ========================================================================
+    
+    % Create input variable names
+    input_var_names = cell(1, Opt.Gen.NoOfInputDim);
+    for i = 1:Opt.Gen.NoOfInputDim
+        input_var_names{i} = strcat('x', num2str(i));
+    end
+    
+    % Create output variable names
+    output_var_names = cell(1, Opt.Gen.NoOfGPs);
+    for i = 1:Opt.Gen.NoOfGPs
+        output_var_names{i} = strcat('f', num2str(i));
+    end
+    
+    % Save GP Pareto front inputs to CSV
+    XParetoGP_table = array2table(XParetoGP, 'VariableNames', input_var_names);
+    writetable(XParetoGP_table, 'GP_Pareto_Front_Inputs.csv');
+    
+    % Save GP Pareto front outputs to CSV
+    YParetoGP_table = array2table(YParetoGP, 'VariableNames', output_var_names);
+    writetable(YParetoGP_table, 'GP_Pareto_Front_Outputs.csv');
+    
+    fprintf('\n========================================================================\n');
+    fprintf('GP Pareto front data successfully saved to CSV files:\n');
+    fprintf('  - GP_Pareto_Front_Inputs.csv  (Input variables)\n');
+    fprintf('  - GP_Pareto_Front_Outputs.csv (Output objectives)\n');
+    fprintf('========================================================================\n\n');
+    
+catch
+    warning('There was an error when writing the log file. Maybe the file was currently open in another program. The algorithm continues to run but some parts of the log file are maybe not correct.') ;
+    fclose('all') ;
+end
+return
+
+function [Xnew,Ynew] = ScaleVariables(X,Y,lb,ub,Opt)
+% Copyright (c) by Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin, 2017-13-12.
+
+%% Scales input and output variabels
+Xnew = zeros(size(X)) ; % scaled inputs
+Ynew = zeros(size(Y)) ; % scaled outputs
+
+%% Scale input variables to [0,1]
+for i = 1 : size(X,2)
+    Xnew(:,i) = (X(:,i)-lb(i)) / (ub(i)-lb(i)) ;
+end
+
+%% Scale output variables to zero mean and unit variance
+MeanOfOutputs = zeros(Opt.Gen.NoOfGPs,1) ;
+stdOfOutputs = zeros(Opt.Gen.NoOfGPs,1) ;
+for i = 1 : size(Y,2)
+    MeanOfOutputs(i) = mean(Y(:,i)); % calculate mean
+    stdOfOutputs(i) = std(Y(:,i)) ; % calculate standard deviation
+    Ynew(:,i) = (Y(:,i) - MeanOfOutputs(i)) / stdOfOutputs(i) ; % scale outputs
+end
+return
+
+function [OptGPhyp] = TrainingOfGP(Xnew,Ynew,OptGP)
+% Copyright (c) by Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin, 2017-13-12.
+
+% Function which minimizes the neg-loglikelihood to find hyperparameters
+%% Initialize variables
+Opt.GP = OptGP ;
+[n,D] = size(Xnew) ;
+
+%% Set initial hyperparameters
+h1 = Opt.GP.h1; % number of hyperparameters from covariance
+h2 = Opt.GP.h2; % number of hyperparameters from likelihood
+
+%% Calculation of squared-distance matrix
+a = Xnew' ;
+K_M = zeros(n,n*D) ;
+for i = 1:D
+    K_M(:,(i-1)*n+1:i*n) = sqdist(a(i,:),a(i,:)) ;
+end
+
+%% Minimize log-negative likeliehood
+% Objective Function
+obj_fun.f = @(hypVar) NLikelihood(hypVar,Xnew,Ynew,K_M,Opt.GP);
+
+% Define bounds
+lb              = ones(h1+h2,1) *  log(sqrt(10^(-3))) ;  % see Jones paper
+ub              = ones(h1+h2,1) *  log(sqrt(10^(3)))  ;  % see Jones paper
+lb(h1+h2)    = -6;
+ub(h1+h2)    = Opt.GP.noiselimit;
+bounds = [lb,ub];
+opts.maxevals = Opt.GP.fun_eval*(h1+h2);
+opts.maxits =  100000*(h1+h2);
+opts.maxdeep = 100000*(h1+h2);
+opts.showits = 0;
+
+% Defintion of options for global search
+[~,x0] = Direct(obj_fun,bounds,opts);
+
+% Defintion of options for fmincon solver
+LSoptions.Algorithm = 'interior-point';
+LSoptions.DerivativeCheck = 'off';
+LSoptions.TolCon = 1e-12;
+LSoptions.Display = 'off';
+LSoptions.Hessian = 'bfgs';
+LSoptions.TolFun = 1e-12;
+LSoptions.PlotFcns = [];
+LSoptions.GradConstr = 'off';
+LSoptions.GradObj = 'on';
+LSoptions.TolX = 1e-14;
+LSoptions.UseParallel = 0;
+
+% Solve optimization problem
+hypResult = fmincon(obj_fun.f,x0,[],[],[],[],lb,ub,[],LSoptions);
+
+%% Return optimal hyperparameters
+Opt.GP.hyp.cov  = hypResult(1:h1);
+Opt.GP.hyp.lik  = hypResult(h1+1:h1+h2);
+OptGPhyp = Opt.GP.hyp ;
+return
+
+function [NLL,dNLL] = NLikelihood(hypVar, Xnew, Ynew, K_M, OptGP)
+% Copyright (c) by Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin, 2017-13-12.
+
+% Calculates the log-negative likelihood
+%% Initialize variables
+[n,D]       = size(Xnew) ;
+Opt.GP      = OptGP ;
+if Opt.GP.cov ~= inf
+    d           = Opt.GP.cov;    % type of Martern
+else
+    d           = 1;
+end
+h1          = Opt.GP.h1 ;    % number of hyperparameters from covariance
+h2          = Opt.GP.h2;     % number of hyperparameters from likelihood
+hyp.cov     = hypVar(1:h1);
+hyp.lik     = hypVar(h1+1:h1+h2);
+ell         = exp(hyp.cov(1:D));
+sf2         = exp(2*hypVar(D+1));
+K           = zeros(n,n) ;
+
+%% Calculate covariance matrix
+for i = 1:D
+    K = K_M(:,(i-1)*n+1:i*n) * d/ell(i)^2 + K;
+end
+
+if Opt.GP.cov ~= inf
+    sqrtK = sqrt(K) ;
+    expnK = exp(-sqrtK) ;
+else
+    expnK = exp(-1/2*K);
+    sqrtK = [];
+end
+
+if      Opt.GP.cov == 3, t = sqrtK ; m =  (1 + t).*expnK;
+elseif  Opt.GP.cov == 1,             m =  expnK;
+elseif  Opt.GP.cov == 5, t = sqrtK ; m =  (1 + t.*(1+t/3)).*expnK;
+elseif  Opt.GP.cov == inf,           m  = expnK;
+end
+K = sf2*m;
+K =  K + eye(n)*exp(hyp.lik*2) ;
+K = (K+K')/2 ; % This guarantees a symmetric matrix
+
+%% Calculate inverse of covariance matrix
+try
+    CH = chol(K) ;
+    invK = CH\(CH'\eye(n));
+catch
+    CH = chol(K+eye(n)*1e-4);
+    invK = CH\(CH'\eye(n));
+    warning('Covariance matrix in Nlikelihood is not positive semi-definite')
+end
+
+%% Calculate determinant of covariance matrix
+logDetK = 2*sum(log(abs(diag(CH)))) ;
+
+%% Calculate hyperperpriors
+logprior = 0 ;
+dlogpriorcov = zeros(1,h1) ;
+for i = 1 : h1
+    [A, dlogpriorcov(i)] =  priorGauss(Opt.GP.priorcov(1),Opt.GP.priorcov(2), hyp.cov(i) ) ;
+    logprior = logprior + A ;
+end
+
+dlogpriorlik = zeros(1,h2);
+for i = 1 : h2
+    [A, dlogpriorlik(i)] =  priorGauss(Opt.GP.priorlik(1),Opt.GP.priorlik(2), hyp.lik(i) ) ;
+    logprior = logprior + A ;
+end
+
+%% Calculate negative log-likeliehood
+NLL = n/2*log(2*pi) + 1/2 * logDetK + 1/2 * Ynew'*invK*Ynew - logprior ;
+
+%% Gradient calculation
+if nargout == 2 % do only if No of output variable is 2 (if necessary)
+    dsq_M = zeros(n,n*D) ;
+    for i = 1 : D
+        dsq_M(:,(i-1)*n+1:i*n)  = K_M(:,(i-1)*n+1:i*n) * (d)/ell(i)^2 ;
+    end
+    
+    c = invK*Ynew;
+    for i = 1 : h1
+        dK = covMaternanisotropic(Opt.GP.cov,hyp.cov, sqrtK, expnK, dsq_M, Xnew, [], i);
+        b = invK* dK ;
+        dNLL_f.cov(i) = 1/2*trace(b) - 1/2*Ynew'*b*c ;
+    end
+    
+    for i = 1 : h2
+        dK = 2 * exp(hyp.lik(i)) * eye(n) * exp(hyp.lik(i));
+        b = invK* dK ;
+        dNLL_f.lik(i) = 1/2*trace(b) - 1/2*Ynew'*b*c ;
+    end
+    
+    dNLL = [dNLL_f.cov';dNLL_f.lik'] - [dlogpriorcov';dlogpriorlik'];
+end
+
+return
+
+function f = posterior_sample(Xnew,Ynew,Opt)
+% Copyright (c) by Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin, 2018-08-07.
+
+% extration of variables from problem structure
+nSpectralpoints = Opt.nSpectralpoints;
+[n,D] = size(Xnew);
+ell = exp(Opt.hyp.cov(1:D));
+sf2 = exp(2*Opt.hyp.cov(D+1));
+sn2 = exp(2*Opt.hyp.lik);
+
+% Sampling of W and b
+sW1  = lhsdesign(nSpectralpoints,D,'criterion','none');
+sW2  = lhsdesign(nSpectralpoints,D,'criterion','none');
+if Opt.cov ~= inf
+    W = repmat(1./(ell)', nSpectralpoints, 1).*norminv(sW1).*sqrt(Opt.cov./chi2inv(sW2,Opt.cov));
+else
+    W = randn(nSpectralpoints,D) .* repmat(1./ell', nSpectralpoints, 1);
+end
+
+b = 2*pi*lhsdesign(nSpectralpoints,1,'criterion','none');
+
+% Calculation of phi
+phi = sqrt(2 * sf2 / nSpectralpoints) * cos(W * Xnew' + repmat(b, 1, n));
+
+% Sampling of theta according to phi
+A = phi * phi' + sn2 * eye(nSpectralpoints);
+
+invA      = invChol(A);
+mu_theta  = invA*phi*Ynew;
+cov_theta = sn2*invA;
+cov_theta = (cov_theta+cov_theta')/2;
+theta     = mvnrnd(mu_theta,cov_theta)';
+
+% Posterior sample (function) according to theta
+f = @(x) (theta' * sqrt(2 * sf2 / nSpectralpoints) * cos(W * x' + repmat(b,1,size(x,1))))';
+return
+
+function [f,varf] = mean_sample(Xnew,Ynew,Opt)
+% Copyright (c) by Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin, 2020-23-05.
+
+% extration of variables from problem structure
+nSpectralpoints = Opt.nSpectralpoints;
+[n,D] = size(Xnew);
+ell = exp(Opt.hyp.cov(1:D));
+sf2 = exp(2*Opt.hyp.cov(D+1));
+sn2 = exp(2*Opt.hyp.lik);
+
+% Sampling of W and b
+sW1  = lhsdesign(nSpectralpoints,D,'criterion','none');
+sW2  = lhsdesign(nSpectralpoints,D,'criterion','none');
+if Opt.cov ~= inf
+    W = repmat(1./(ell)', nSpectralpoints, 1).*norminv(sW1).*sqrt(Opt.cov./chi2inv(sW2,Opt.cov));
+else
+    W = randn(nSpectralpoints,D) .* repmat(1./ell', nSpectralpoints, 1);
+end
+
+b = 2*pi*lhsdesign(nSpectralpoints,1,'criterion','none');
+
+% Calculation of phi
+phi = sqrt(2 * sf2 / nSpectralpoints) * cos(W * Xnew' + repmat(b, 1, n));
+
+% Sampling of theta according to phi
+A = phi * phi' + sn2 * eye(nSpectralpoints);
+
+invA      = invChol(A);
+mu_theta  = invA*phi*Ynew;
+
+% Mean approximation (function) according to theta
+phi_x = @(x) sqrt(2 * sf2 / nSpectralpoints) * cos(W * x' + repmat(b,1,size(x,1)));
+f     = @(x) (mu_theta' * phi_x(x))';
+varf  = @(x) sn2 + sn2*phi_x(x)'*invA*phi_x(x); 
+return
+
+function v = hypervolumemonte(P,r,N)
+% Copyright (c) 2009, Yi Cao
+% All rights reserved.
+
+% HYPERVOUME    Hypervolume indicator as a measure of Pareto front estimate.
+% ... (keep original code) ...
+if nargin<3
+    N=1000;
+end
+if ~isscalar(N)
+    C=N;
+    N=size(C,1);
+else
+    C=rand(N,d);
+end
+
+fDominated=false(N,1);
+lB=min(P);
+fcheck=all(bsxfun(@gt, C, lB),2);
+
+for k=1:n
+    if any(fcheck)
+        f=all(bsxfun(@gt, C(fcheck,:), P(k,:)),2);
+        fDominated(fcheck)=f;
+        fcheck(fcheck)=~f;
+    end
+end
+
+v=sum(fDominated)/N;
+return
+
+function K = covMaternanisotropic(d, hyp, sqrtK,expnK, dsq_M, x, z, i)
+% Copyright (c) 2005-2017 Carl Edward Rasmussen & Hannes Nickisch. All rights reserved.
+
+[n,D] = size(x);
+sf2 = exp(2*hyp(D+1));
+
+if nargin<7                                                        % covariances
+    if      d == 3, t = sqrtK ; m =  (1 + t).*expnK;
+    elseif  d == 1,             m =  expnK;
+    elseif  d == 5, t = sqrtK ; m =  (1 + t.*(1+t/3)).*expnK;
+    elseif  d == inf, m = expnK;
+    end
+    K = sf2*m;
+else                                                               % derivatives
+    if i<=D                                               % length scale parameter
+        Ki = dsq_M(:,(i-1)*n+1:i*n) ;
+        if     d == 3,             dm = expnK;
+        elseif d == 1, t = sqrtK ; dm = (1./t).*expnK;
+        elseif d == 5, t = sqrtK ; dm = ((1+t)/3).*expnK;
+        elseif d == inf; dm = -1/2*expnK;
+        end
+        
+        K = sf2*dm.*Ki;
+        K(Ki<1e-12) = 0;                                    % fix limit case for d=1
+    elseif i==D+1                                            % magnitude parameter
+        if      d == 3, t = sqrtK ; m =  (1 + t).*expnK;
+        elseif  d == 1,             m =  expnK;
+        elseif  d == 5, t = sqrtK ; m =  (1 + t.*(1+t/3)).*expnK;
+        elseif  d == inf,           m = expnK;
+        end
+        K = 2*sf2*m;
+    end
+end
+return
+
+function D = sqdist(X1, X2)
+% Copyright (c) 2016, Mo Chen
+% All rights reserved.
+
+% Pairwise square Euclidean distance between two sample sets
+D = bsxfun(@plus,dot(X2,X2,1),dot(X1,X1,1)')-2*(X1'*X2);
+D(D<0) = 0 ; % check due to numerical errors
+return
+
+function [lp,dlp] = priorGauss(mu,s2,x)
+% Copyright (c) 2005-2017 Carl Edward Rasmussen & Hannes Nickisch. All rights reserved.
+
+lp  = -(x-mu).^2/(2*s2) - log(2*pi*s2)/2;
+dlp = -(x-mu)/s2;
+return
+
+function [f,const] = pareto_objective(x,OptSample)
+% Copyright (c) by Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin, 2017-13-12.
+
+Opt.Sample = OptSample;
+f = zeros(size(x,1),size(Opt.Sample,2));
+for i = 1:size(Opt.Sample,2)
+    f(:,i) = Opt.Sample(i).f(x);
+end
+const = [];
+return
+
+function [Sample_pareto,Sample_xpareto,Sample_nadir] = Find_sample_pareto(Opt,it)
+% Copyright (c) by Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin, 2017-13-12.
+
+D = Opt.Gen.NoOfInputDim;               % Number of input dimensions
+options = nsgaopt();                    % create default options structure
+options.popsize = Opt.pop;              % populaion size
+options.maxGen  = Opt.Generation;       % max generation
+options.numObj = Opt.Gen.NoOfGPs;       % number of objectives
+options.numVar = D;                     % number of design variables
+options.numCons = 0;                    % number of constraints
+options.outputfuns = [];                % saving pop
+options.lb = zeros(1,D);                % lower bound of x
+options.ub = ones(1,D);                 % upper bound of x
+options.objfun = @(x) pareto_objective(x,Opt.Sample);        % objective function handle
+options.useParallel = 'no';             % parallel computation is non-essential here
+if it > 1
+options.initfun = {@(opt,pop) initpop_new(opt,pop,Opt)};    
+end
+[~,result] = evalc('nsga2(options);');  % begin the optimization!
+
+Sample_xpareto = zeros(Opt.pop,D);
+Sample_pareto = zeros(Opt.pop,Opt.Gen.NoOfGPs);
+result = result.pops(Opt.Generation,:);
+
+for k = 1:Opt.pop
+    Sample_xpareto(k,:) = result(k).var;
+    Sample_pareto(k,:) = result(k).obj;
+end
+
+for k = 1:Opt.Gen.NoOfGPs
+    Sample_nadir(k) = max(Sample_pareto(:,k));
+end
+return
+
+function pop = initpop_new(opt,pop,Opt)
+% Copyright (c) by Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin, 2020-22-05.
+
+for p = 1:opt.popsize
+    pop(p).var = Opt.warmstart_pareto(p,:);
+end
+
+return
+
+function [Mean_pareto,Mean_xpareto] = Find_mean_pareto(Opt)
+% Copyright (c) by Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin, 2017-13-12.
+
+D = Opt.Gen.NoOfInputDim;               % Number of input dimensions
+options = nsgaopt();                    % create default options structure
+options.popsize = Opt.pop;              % populaion size
+options.maxGen  = Opt.Generation;       % max generation
+options.numObj = Opt.Gen.NoOfGPs;       % number of objectives
+options.numVar = D;                     % number of design variables
+options.numCons = 0;                    % number of constraints
+options.outputfuns = [];                % saving pop
+options.lb = zeros(1,D);                % lower bound of x
+options.ub = ones(1,D);                 % upper bound of x
+options.objfun = @(x) pareto_objective(x,Opt.Mean); % objective function handle
+options.useParallel = 'no';             % parallel computation is non-essential here
+[~,result] = evalc('nsga2(options);');  % begin the optimization!
+
+Mean_xpareto = zeros(Opt.pop,D);
+Mean_pareto  = zeros(Opt.pop,Opt.Gen.NoOfGPs);
+result       = result.pops(Opt.Generation,:);
+
+for k = 1:Opt.pop
+    Mean_xpareto(k,:) = result(k).var;
+    Mean_pareto(k,:) = result(k).obj;
+end
+
+return
+
+function hv = hypervolume_2D(Yfront,r)
+% The mex-file used follows the description of:
+% 'M. Emmerich, K. Yang, A. Deutz, H. Wang and C. M. Fonseca. A
+% Multicriteria Generalization of Bayesian Global Optimization.'
+
+AYfront = remove_points_above_reference(Yfront,r);
+if isempty(AYfront)
+    hv = 0;
+else
+    normvec = min(AYfront,[],1);
+    A =  AYfront-repmat(normvec,size(AYfront,1),1);
+    A =  A * diag(1./(r-normvec));
+    A = -A + ones(size(A));
+    A = sortrows(A,2);
+    hyp_percentage = hypervolume2D(A,[0,0]);
+    hv = prod(r-normvec)*hyp_percentage;
+end
+return
+
+function hv = hypervolume_3D(Yfront,r)
+% The mex-file used follows the description of:
+% 'K. Yang, M. Emmerich, A. Deutz and C. M. Fonseca. A
+% Computing 3-D Expected Hypervolume Improvement and Related Integrals in
+% Asymptotically Optimal Time.'
+
+AYfront = remove_points_above_reference(Yfront,r);
+if isempty(AYfront)
+    hv = 0;
+else
+    normvec = min(AYfront,[],1);
+    A = AYfront-repmat(normvec,size(AYfront,1),1) ;
+    A = A *diag(1./(r-normvec));
+    A = -A + ones(size(A)) ;
+    A = sortrows(A,3);
+    hyp_percentage = hypervolume3D(A,[0,0,0],[1,1,1]);
+    hv = prod(r-normvec)*hyp_percentage;
+end
+return
+
+function [index,hv_imp] = hypervolume_improvement_index(Ynew,Sample_nadir,Sample_pareto,Opt)
+% Copyright (c) by Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin, 2017-13-12.
+
+r = Sample_nadir + 0.01*(max(Sample_pareto)-min(Sample_pareto));
+index = [];
+
+for i = 1 : Opt.NoOfBachSequential
+    
+    Yfront = Ynew(paretofront(Ynew),:);
+    
+    if size(Ynew,2) == 2
+        hvY = hypervolume_2D(Yfront,r);
+        
+        for k = 1:size(Sample_pareto,1)
+            A = [Ynew;Sample_pareto(k,:)];
+            Afront = A(paretofront(A),:);
+            hv = hypervolume_2D(Afront,r);
+            hv_improvement(k) = hv-hvY;
+        end
+        
+    elseif size(Ynew,2) == 3
+        hvY = hypervolume_3D(Yfront,r);
+        
+        for k = 1:size(Sample_pareto,1)
+            A = [Ynew;Sample_pareto(k,:)];
+            Afront = A(paretofront(A),:);
+            hv = hypervolume_3D(Afront,r);
+            hv_improvement(k) = hv-hvY;
+        end
+        
+    else
+        AYfront = remove_points_above_reference(Yfront,r);
+        normvec = min(AYfront,[],1);
+        hyp_percentage = hypervolumemonte(AYfront-repmat(normvec,size(AYfront,1),1),r-normvec,3000);
+        hvY = prod(r-normvec)*hyp_percentage;
+        
+        hv_improvement = zeros(size(Sample_pareto,1),1);
+        for k = 1:size(Sample_pareto,1)
+            B = [Ynew;Sample_pareto(k,:)];
+            Bfront = B(paretofront(B),:);
+            ABfront = remove_points_above_reference(Bfront,r);
+            if isempty(ABfront)
+                hv_improvement(k) = 0;
+            else
+                normvec = min(ABfront,[],1);
+                hyp_percentage = hypervolumemonte(ABfront-repmat(normvec,size(ABfront,1),1),r-normvec,10000);
+                hv = prod(r-normvec)*hyp_percentage;
+                hv_improvement(k) = hv-hvY;
+            end
+        end
+    end
+    
+    if i == 1
+        hvY0 = hvY;
+    end
+    
+    [~,Currentindex] = max(hv_improvement);
+    Ynew = [Ynew;Sample_pareto(Currentindex,:)];
+    index = [index;Currentindex];
+end
+hv_imp = hv_improvement(index(end))+hvY-hvY0;
+return
+
+function A = remove_points_above_reference(Afront,r)
+% Copyright (c) by Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin, 2017-13-12.
+
+[A,~] = sortrows(Afront);
+for p = 1:size(Afront,2)
+    A = A(A(:,p)<=r(p),:);
+end
+return
+
+function Opt = set_option_structure(Opt,X,Y)
+% Copyright (c) by Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin, 2017-13-12.
+
+%% Extraction of input and output dimensions from X and Y
+Opt.Gen.NoOfGPs = size(Y,2);           % Number of GPs to be trained
+Opt.Gen.NoOfInputDim = size(X,2);      % Number of inputs dimensions
+for i = 1 : Opt.Gen.NoOfGPs
+    %% Set up GP options
+    Opt.GP(i).cov = Opt.GP(i).matern;      % Matern type 1 / 3 / 5 / inf
+    
+    %% Set hyperpriors (MAP)
+    Opt.GP(i).noiselimit = 0;                      % Upper bound on noise
+    Opt.GP(i).var        = 10;                     % Upper bound on signal variance
+    Opt.GP(i).h1         = Opt.Gen.NoOfInputDim+1; % Number of hyperparameters from covariance
+    Opt.GP(i).h2         = 1;                      % Number of hyperparameters from likelihood
+    
+    %% priorGauss (mean, var)
+    Opt.GP(i).priorlik  = [-6 ,Opt.GP(i).var];
+    Opt.GP(i).priorcov  = [ 0 ,Opt.GP(i).var];
+    
+    %% Initial values for hyperparameters
+    Opt.GP(i).hyp.cov       = zeros(1, Opt.GP(i).h1);
+    Opt.GP(i).hyp.lik       = log(1e-2);
+end
+return
