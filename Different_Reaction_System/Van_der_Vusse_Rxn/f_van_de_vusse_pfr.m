@@ -30,7 +30,7 @@ function c_end = f_van_de_vusse_pfr(X, cA_0, k_ref, Ea, Tref, rd)
 %   c_end  - [n x 4] outlet concentrations [cA cB cC cD], mol/L
 
 if nargin < 6
-    rd = 0.01;
+    rd = 0.01; % 1% Noise injected into the system
 end
 
 n = size(X, 1);

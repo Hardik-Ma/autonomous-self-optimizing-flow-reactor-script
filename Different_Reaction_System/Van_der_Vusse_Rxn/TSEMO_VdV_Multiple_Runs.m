@@ -8,9 +8,14 @@ clc
 
 % Define batches: [maxeval, number_of_runs, initial_dataset_size]
 % Each row is one batch with THREE parameters
+% Matern 3, 1% error
 batches = [
     % maxeval, runs, initial_points
-    10,  2,  4;   % Batch 1: 2 runs with maxeval=10, 4 initial points
+    10,  50,  4;   % Batch 1: 2 runs with maxeval=10, 4 initial points
+    20,  50,  4;
+    50,  50,  4;
+    80,  50,  4;
+    100,  50,  4;
 ];
 
 % Number of workers (CPU cores) to use
