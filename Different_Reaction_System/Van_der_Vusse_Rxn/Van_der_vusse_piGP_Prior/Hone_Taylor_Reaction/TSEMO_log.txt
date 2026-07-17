@@ -1,0 +1,75 @@
+
+ TSEMO log file created on 29-Jan-2025 
+
+ This file shows the initial specifications of TSEMO and logs the output.
+ ¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯
+ License information 
+
+ BSD 2-Clause License 
+
+ Copyright (c) 2017, Eric Bradford, Artur M. Schweidtmann and Alexei Lapkin
+ All rights reserved. 
+
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions are met: 
+
+ *Redistributions of source code must retain the above copyright notice, this   
+  list of conditions and the following disclaimer. 
+
+ *Redistributions in binary form must reproduce the above copyright notice,   
+  this list of conditions and the following disclaimer in the documentation   
+  and/or other materials provided with the distribution. 
+
+ ¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯
+ Problem specifications 
+
+ Function used:   @(x)fun_PFR_SNAr_2D(x,rd) 
+
+ Number of inputs:   2
+ Number of outputs:  2 
+
+ Lower bounds of decision variables:
+      x1      x2
+ 25.0000  0.2500
+ 
+ Upper bounds of decision variables:
+      x1      x2
+ 75.0000  2.0000
+ ¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯
+ Algorithm options 
+
+ Maximum number of function evaluations:  20
+ Sample batch size:                       1
+ Number of algorithm iterations:          20 
+
+ Genetic algorithm population size:        100
+ Genetic algorithm number of generations:  100 
+
+                                               f1      f2
+ Number of spectral sampling points:         4000    4000
+ Type of matern function:                       1       1
+ Direct evaluations per input dimension:      200     200
+ ¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯
+ Initial data set 
+
+ Number of initial data points:  6 
+
+ Initial input data matrix:
+      x1      x2
+ 28.2114  0.9589
+ 41.5752  1.6904
+ 53.5562  1.2719
+ 68.4189  0.6460
+ 64.7053  1.9355
+ 46.2665  0.2975
+
+ Initial output data matrix:
+      f1      f2
+ -5.7562  0.4693
+ -5.6764 -0.5628
+ -6.0109 -0.7368
+ -6.6445 -0.5890
+ -5.7357 -1.3528
+ -6.6643  0.8916
+
+ ¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯
